@@ -2,33 +2,44 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-*.egg
 *.egg-info/
-build/
-dist/
+*.so
 
 # Virtual environments
 .venv/
 venv/
 env/
 
+# macOS
+.DS_Store
+
+# Model weights (re-downloadable or large training artifacts)
+*.pt
+*.pth
+*.onnx
+*.torchscript
+
+# Datasets — never commit
+datasets/
+*.zip
+*.tar
+*.tar.gz
+
+# ultralytics / training run outputs
+runs/
+runs-backup/
+experiments/runs/
+experiments/weights/
+yolov8/weights/
+
 # IDE
 .vscode/
 .idea/
 *.swp
-.DS_Store
 
-# Model weights / training artifacts
-*.pt
-*.pth
-*.onnx
-*.engine
-runs/
-weights/
+# Cache
+.cache/
+*.cache
 
-# Datasets
-datasets/
-*.zip
-*.tar.gz
+# Notebooks scratch
+.ipynb_checkpoints/

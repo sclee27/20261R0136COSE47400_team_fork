@@ -1,0 +1,24 @@
+# SeaDronesSee v2 — object detection dataset definition for ultralytics.
+#
+# Expected layout under `path`:
+#     images/train/*.jpg
+#     images/val/*.jpg
+#     labels/train/*.txt   (YOLO format, produced by scripts/convert_sds.py)
+#     labels/val/*.txt
+#
+# `path` is set as an absolute path on the GPU instance. Edit this to match
+# wherever you extracted+converted SeaDronesSee before training.
+
+path: /root/datasets/sds
+train: images/train
+val: images/val
+# test: images/test   # uncomment when SDS test labels are released (currently private)
+
+nc: 6
+names:
+  0: swimmer
+  1: floater
+  2: life_jacket
+  3: boat
+  4: swimmer_on_boat
+  5: floater_on_boat
