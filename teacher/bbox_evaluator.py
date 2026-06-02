@@ -4,20 +4,18 @@ YOLOv8m BBox Evaluator Networks
 Evaluates YOLO predicted bboxes using backbone feature maps.
 
 Level assignment (S = shorter side in original image scale):
-    Original image : 8  < S <= 16   (raw RGB, stride=1, 3ch)
-    P1             : 16 < S <= 40   (YOLO P1 stem, stride=2, 48ch)
+    Original image : 10 < S <= 20   (raw RGB, stride=1, 3ch)
+    P1             : 20 < S <= 40   (YOLO P1 stem, stride=2, 48ch)
     P2             : 40 < S <= 80   (stride=4,  96ch)
     P3             : 80 < S <= 160  (stride=8,  192ch)
     P4             : 160 < S <= 320 (stride=16, 384ch)
-    P5             : 320 < S <= 640 (stride=32, 576ch)
 
 Feature map patch sizes (after stride normalization):
-    orig : 8-16px short side (raw pixels, no stride reduction)
-    P1   : 8-20px short side in feature space  (stride=2)
+    orig : 8-20px short side (raw pixels, no stride reduction)
+    P1   : 10-20px short side in feature space  (stride=2)
     P2   : 10-20px short side in feature space (stride=4)
     P3   : 10-20px short side in feature space (stride=8)
     P4   : 10-20px short side in feature space (stride=16)
-    P5   : 10-20px short side in feature space (stride=32)
 
 Constraints:
     - Aspect ratio > 1:4 -> rejected (flagged, no score assigned)
@@ -46,7 +44,7 @@ MAX_ASPECT_RATIO = 4.0
 ROI_K            = 7
 NUM_CLASSES      = 80
 
-LEVEL_NAMES = ['orig', 'p1', 'p2', 'p3', 'p4', 'p5']
+LEVEL_NAMES = ['orig', 'p1', 'p2', 'p3', 'p4']
 
 LEVEL_STRIDES = {
     'orig': 1,
@@ -54,7 +52,6 @@ LEVEL_STRIDES = {
     'p2':   4,
     'p3':   8,
     'p4':   16,
-    'p5':   32,
 }
 
 # shorter side upper bounds per level
@@ -64,7 +61,6 @@ LEVEL_UPPER_S = {
     'p2':   80,
     'p3':   160,
     'p4':   320,
-    'p5':   640,
 }
 
 # YOLOv8m backbone output channels per level
@@ -73,8 +69,7 @@ LEVEL_IN_CHANNELS = {
     'p1':   48,    # YOLO P1 stem
     'p2':   96,
     'p3':   192,
-    'p4':   384,
-    'p5':   576,
+    'p4':   384
 }
 
 
@@ -313,41 +308,6 @@ class P4Net(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Level 5 -- P5 (320 < S <= 640px, stride=32, 576ch)
-# ---------------------------------------------------------------------------
-
-class P5FullMapConv(nn.Module):
-    """
-    Full-map conv for P5 level.
-    Fully semantic -- 1x1 projection only.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.convs = nn.Sequential(
-            conv_bn_relu(576, 128, k=1, padding=0),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.convs(x)
-
-
-class P5Net(nn.Module):
-    """
-    Evaluator head for P5 level.
-    Input patch (post ROI crop): 128ch, short=10-20px in feature space.
-    """
-
-    def __init__(self, num_classes: int = NUM_CLASSES):
-        super().__init__()
-        self.head = ClassifierHead(128 * ROI_K * ROI_K, num_classes=num_classes)
-
-    def forward(self, patch: torch.Tensor) -> torch.Tensor:
-        x = patch.flatten(1)
-        return self.head(x)
-
-
-# ---------------------------------------------------------------------------
 # Full Evaluator Pipeline
 # ---------------------------------------------------------------------------
 
@@ -369,7 +329,6 @@ class YOLOBBoxEvaluator(nn.Module):
         'p2':   (B, 96,  160, 160)
         'p3':   (B, 192,  80,  80)
         'p4':   (B, 384,  40,  40)
-        'p5':   (B, 576,  20,  20)
 
     bboxes: (B, A, 4) float tensor [x1, y1, x2, y2] original image scale
             A = number of anchor/predicted boxes (fixed across the batch)
@@ -390,8 +349,7 @@ class YOLOBBoxEvaluator(nn.Module):
             'p1': P1FullMapConv(),
             'p2': P2FullMapConv(),
             'p3': P3FullMapConv(),
-            'p4': P4FullMapConv(),
-            'p5': P5FullMapConv(),
+            'p4': P4FullMapConv()
         })
 
         # Evaluator heads (applied to ROI-cropped patches)
@@ -401,7 +359,6 @@ class YOLOBBoxEvaluator(nn.Module):
             'p2':   P2Net(num_classes),
             'p3':   P3Net(num_classes),
             'p4':   P4Net(num_classes),
-            'p5':   P5Net(num_classes),
         })
 
     # ------------------------------------------------------------------
@@ -422,7 +379,8 @@ class YOLOBBoxEvaluator(nn.Module):
         h = bboxes[:, 3] - bboxes[:, 1]
         longer  = torch.max(w, h)
         shorter = torch.min(w, h)
-        return (longer / (shorter + 1e-6)) <= max_ratio
+
+        return ((longer / (shorter + 1e-6)) <= max_ratio) & (shorter <= 320)
 
     @staticmethod
     def _assign_levels(bboxes: torch.Tensor) -> torch.Tensor:
@@ -433,18 +391,17 @@ class YOLOBBoxEvaluator(nn.Module):
             bboxes: (N, 4) [x1, y1, x2, y2]
         Returns:
             level_ids: (N,) long tensor
-                0=orig, 1=p1, 2=p2, 3=p3, 4=p4, 5=p5
+                0=orig, 1=p1, 2=p2, 3=p3, 4=p4
         """
         w = bboxes[:, 2] - bboxes[:, 0]
         h = bboxes[:, 3] - bboxes[:, 1]
         shorter = torch.min(w, h)
 
         ids = torch.zeros(len(bboxes), dtype=torch.long, device=bboxes.device)
-        ids[shorter >  16] = 1   # p1
+        ids[shorter >  20] = 1   # p1
         ids[shorter >  40] = 2   # p2
         ids[shorter >  80] = 3   # p3
         ids[shorter > 160] = 4   # p4
-        ids[shorter > 320] = 5   # p5
         return ids
 
     # ------------------------------------------------------------------
@@ -459,7 +416,7 @@ class YOLOBBoxEvaluator(nn.Module):
         # ── Step 1: Full-map convs (batched over B, once per image) ────────
         processed = {}
         processed['orig'] = self.orig_conv(feature_maps['orig'])
-        for level in ('p1', 'p2', 'p3', 'p4', 'p5'):
+        for level in ('p1', 'p2', 'p3', 'p4'):
             processed[level] = self.full_map_convs[level](feature_maps[level])
 
         # ── Step 2: Vectorized filter and level assignment ──────────────────
@@ -544,11 +501,11 @@ if __name__ == '__main__':
         ],
         [   # image 1
             [100, 100, 115, 112],    # S=12  -> orig  valid
-            [50,  50,  450, 400],    # S=350 -> p5    valid
+            [50,  50,  450, 400],    # S=350 -> p5    REJECTED
             [30,  30,  100,  90],    # S=60  -> p2    valid
             [10,  10,  200, 180],    # S=170 -> p4    valid
             [20,  20,   90,  80],    # S=60  -> p2    valid
-            [0,   0,   500, 340],    # S=340 -> p5    valid
+            [0,   0,   500, 340],    # S=340 -> p5    REJECTED
             [5,   5,   50,  45],     # S=40  -> p1    valid
         ],
     ], dtype=torch.float32)   # (2, 7, 4)
