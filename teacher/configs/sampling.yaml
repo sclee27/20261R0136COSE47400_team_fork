@@ -1,0 +1,54 @@
+# =============================================================================
+# Teacher sampling test config  (block-structured, like a training cfg)
+# =============================================================================
+# A single file to toggle two experiments:
+#   (1) Necessity of P3/P4/P5  -> switch on/off via levels.enabled
+#   (2) GT-linked jitter sampling -> mode: gt_linked + the jitter block
+#
+# The legacy stride sampler is reproducible as-is via mode: stride (for comparison).
+# =============================================================================
+
+image_size: 640
+mode: gt_linked            # gt_linked (proposed fix) | stride (legacy, for comparison)
+
+# -- Block 1: levels (P3/P4/P5 drop test) -------------------------------------
+levels:
+  enabled: [orig, p1, p2]               # levels NOT listed here are dropped (P3/P4/P5 excluded)
+  upper_short:                          # shorter-side upper bound (px, in the 640 frame)
+    orig: 20                            # = 20 * stride; matches evaluator _assign_levels (>20 -> p1)
+    p1:   40
+    p2:   80
+    p3:   160
+    p4:   320
+    p5:   640
+
+# -- Block 2: jitter sampler (gt_linked mode) ---------------------------------
+jitter:
+  scale:   [0.7, 2.0]      # box_short = GT_short * U(scale)  (small=crops object, large=adds background)
+  log:     false           # true -> sample scale log-uniformly
+  pos_frac: 0.6            # center offset = U(+/-pos_frac) * GT_size
+  n_candidates: 16         # number of candidate boxes generated per GT
+
+# -- Block 3: stride sampler (legacy, comparison only) ------------------------
+stride:
+  strides:  [1, 2, 4, 8, 16, 32]
+  n_short:  3
+  n_ratios: 2
+  sig_scale: 4.0
+
+# -- Block 4: labeling (pos/bg/ignore + stratify) -----------------------------
+label:
+  iou_pos: 0.5             # >= -> positive (dominant GT class)
+  iou_neg: 0.2             # <  -> background
+  stratify_bins: 5         # number of IoU buckets for stratified (balanced) sampling
+  n_per_bin: 4             # target count per bucket
+
+# -- Block 5: data ------------------------------------------------------------
+data:
+  # Annotation dir holding instances_{train,val}.json.
+  # Relative paths resolve from the project root; absolute paths are used as-is.
+  # Override per-machine without editing this file via env var SDS_ANN_DIR.
+  ann_dir: data_sds/annotations
+  split: train             # train | val
+  max_images: 500
+  seed: 0

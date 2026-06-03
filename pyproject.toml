@@ -1,0 +1,22 @@
+[project]
+name = "sod-project"
+version = "0.1.0"
+description = "Teacher-Guided Anchor Selection for YOLOv8 (SeaDronesSee)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+
+# Environment for the yolov8/ package and the teacher/ module.
+# Pinned to the currently working versions so uv reproduces the known-good env
+# (no surprise upgrades / large re-downloads). Bump deliberately when needed.
+dependencies = [
+    "torch==2.11.0",        # backbone / evaluator / loss / tal
+    "torchvision==0.26.0",  # roi_align in bbox_evaluator
+    "numpy==2.4.4",         # sampling, metrics
+    "pyyaml==6.0.3",        # config loading (yolov8 cfg + teacher sampling.yaml)
+    "matplotlib==3.10.9",   # teacher/test_sampling.py --plot
+    "ultralytics==8.4.50",  # unpickle the official yolov8m.pt checkpoint (backbone/verify)
+]
+
+[tool.uv]
+# This repo is not itself an installable package -- uv only manages the venv.
+package = false

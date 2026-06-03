@@ -19,8 +19,13 @@ env/
 *.onnx
 *.torchscript
 
-# Datasets — never commit
+# Datasets — never commit images, but DO track annotation JSON
+# (small, and required for teacher/ sampling tests)
 datasets/
+data_sds/*
+!data_sds/annotations/
+data_sds/annotations/*
+!data_sds/annotations/*.json
 *.zip
 *.tar
 *.tar.gz
@@ -43,3 +48,6 @@ yolov8/weights/
 
 # Notebooks scratch
 .ipynb_checkpoints/
+
+# Papers (large PDFs, not source)
+papers/
