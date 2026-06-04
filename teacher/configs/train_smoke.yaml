@@ -1,0 +1,74 @@
+# =====================================================================
+# Tiny smoke config for a CPU wiring test (same shape as train.yaml).
+# Trains 1 epoch on 2 images so the full pipeline can be exercised fast.
+# =====================================================================
+
+image_size: 640
+
+# mode selects the box SAMPLER the dataset uses:
+#   original | jittering | jittering_v2
+mode: jittering
+
+# -- shared sampling blocks --------------------------------------------
+levels:
+  enabled: [orig, p1, p2]   # drop P3/P4/P5 (no SDS objects there)
+  upper_short: { orig: 20, p1: 40, p2: 80, p3: 160, p4: 320, p5: 640 }
+
+jitter:
+  scale: [0.7, 2.0]         # TUNABLE: box_short = GT_short * U(lo, hi)
+  log: false
+  pos_frac: 0.6             # TUNABLE: center offset
+  n_candidates: 4           # tiny: fewer candidates per GT for the smoke test
+
+stride:
+  strides: [1, 2, 4, 8, 16, 32]
+  n_short: 3
+  n_ratios: 2
+  sig_scale: 4.0
+
+label:
+  iou_pos: 0.5              # TUNABLE
+  iou_neg: 0.2              # TUNABLE
+  stratify_bins: 5
+  n_per_bin: 2              # tiny: fewer positives per bin
+
+data:
+  ann_dir: data_sds/annotations
+  split: train
+  max_images: 2            # tiny: only 2 images
+  seed: 0
+
+# -- validation --------------------------------------------------------
+val:
+  split: val
+  max_images: 2            # tiny
+
+# -- dataset / IO ------------------------------------------------------
+dataset:
+  images_dir: data_sds/images   # images at <images_dir>/<split>/<file_name>
+  pad_value: 114
+  stratify: true
+  num_classes: 5                # FOREGROUND classes; evaluator gets +1 for background
+
+# -- frozen backbone ---------------------------------------------------
+backbone:
+  weights: experiments/weights/yolov8m.pt
+  scale: m
+  cfg: cfg/yolov8.yaml
+  freeze: true
+
+# -- optimization (tiny CPU run) ---------------------------------------
+train:
+  epochs: 1
+  batch_size: 1
+  lr: 0.001
+  weight_decay: 0.0005
+  optimizer: adamw         # adamw | sgd
+  momentum: 0.9
+  device: cpu              # force CPU for the wiring test
+  amp: false               # no mixed precision on CPU
+  num_workers: 0           # no worker subprocesses
+  out_dir: teacher/runs
+  exp_name: smoke
+  log_every: 50
+  seed: 0
