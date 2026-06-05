@@ -46,6 +46,63 @@ def stratify_indices(iou_dom: np.ndarray, label_cfg, rng: np.random.Generator) -
         return np.zeros(0, int)
     return np.concatenate(chosen)
 
+def stratify_indices_per_gt(
+        iou_dom: np.ndarray,
+        dom_idx: np.ndarray,
+        num_gts: int,
+        label_cfg,
+        rng: np.random.Generator,
+) -> np.ndarray:
+    """Stratified sampling performed independently for each GT instance.
+
+    Candidates are partitioned by which specific GT instance is their
+    dominant GT (dom_idx value).  Inside each GT's group the IoU spectrum
+    is bucketed and sampled with the same n_per_bin / stratify_bins logic
+    as stratify_indices.
+
+    This gives every individual object in the image its own balanced
+    training signal regardless of how many candidates happened to be
+    generated near it -- a dense cluster of GTs cannot drown out an
+    isolated one.
+
+    Args:
+        iou_dom:   (M,) IoU of each candidate with its dominant GT.
+        dom_idx:   (M,) dominant GT index for each candidate (0..num_gts-1).
+                   Candidates with dom_idx == -1 (no GT) are skipped.
+        num_gts:   total number of GT instances in this image.
+        label_cfg: config with .stratify_bins and .n_per_bin.
+        rng:       numpy random Generator for reproducible sampling.
+
+    Returns:
+        indices (K,) into the original candidate array, one flat array
+        concatenating the per-GT selections.
+    """
+    chosen = []
+    bins   = np.linspace(0.0, 1.0, label_cfg.stratify_bins + 1)
+
+    for gt_id in range(num_gts):
+        group_idx = np.where(dom_idx == gt_id)[0]   # candidates dominated by this GT
+        if len(group_idx) == 0:
+            continue
+
+        group_iou = iou_dom[group_idx]
+
+        
+        bucket = np.clip(np.digitize(group_iou, bins) - 1,
+                         0, label_cfg.stratify_bins - 1)
+
+        for b in range(label_cfg.stratify_bins):
+            bin_pos = np.where(bucket == b)[0]
+            if len(bin_pos) == 0:
+                continue
+            k = min(label_cfg.n_per_bin, len(bin_pos))
+            sampled_positions = rng.choice(bin_pos, size=k, replace=False)
+            chosen.append(group_idx[sampled_positions])  # map back to global indices
+
+    if not chosen:
+        return np.zeros(0, int)
+    return np.concatenate(chosen)
+
 
 def label_summary(labels: np.ndarray, num_classes: int) -> dict:
     bg = num_classes

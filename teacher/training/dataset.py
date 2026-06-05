@@ -41,7 +41,7 @@ from sampling.data import (  # noqa: E402
 )
 from sampling import boxes as boxes_mod  # noqa: E402
 from sampling.metrics import iou_and_dominant  # noqa: E402
-from sampling.labeling import label_boxes, stratify_indices  # noqa: E402
+from sampling.labeling import label_boxes, stratify_indices, stratify_indices_per_gt  # noqa: E402
 from training.model import filter_to_enabled_levels  # noqa: E402
 
 # Friendly experiment names -> internal sampler modes.
@@ -206,7 +206,18 @@ class TeacherBBoxDataset(torch.utils.data.Dataset):
 
         # 7. Optional stratified subsampling across IoU buckets.
         if self.stratify:
-            keep = stratify_indices(iou_dom, self.sampling_cfg.label, rng)
+            # keep = stratify_indices(iou_dom, self.sampling_cfg.label, rng) --> Original stratify 
+            
+            # New stratify (per GT)
+            num_gts = len(cls) # Extract the number of ground truth objects
+            keep = stratify_indices_per_gt(
+                iou_dom=iou_dom, 
+                dom_idx=dom_idx, 
+                num_gts=num_gts, 
+                label_cfg=self.sampling_cfg.label, 
+                rng=rng
+            )
+
             cand = cand[keep]
             labels = labels[keep]
 
