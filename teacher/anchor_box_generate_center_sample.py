@@ -139,6 +139,92 @@ def get_GToverlap_center_regions_SINGLE(target_coords : np.array, anchor_boxes :
     return sampled_centers, no_sample_pairs
 
 
+''' 
+THIS IS CODE TO BE USED IN boxes.py
+It gets all targets, target_index for main target, then compares all other targets to find single overlapping region for main GT
+'''
+# target_coords : GT box coordinates for one Image
+# - If there are 3 objects in this image it will be shaped (3, 4) (last dim : x1, y1, x2, y2 of integers)
+# anchor_boxes : (B, 2) where B is number of anchor boxes (last dim : w, h)
+def get_GToverlap_center_regions_SINGLE_for_one_GT(target_idx : int, target_coords : np.array, anchor_boxes : np.array):
+    assert (target_coords.shape[1] == 4) and (anchor_boxes.shape[1] == 2)
+    assert target_coords.dtype == np.int32
+    assert anchor_boxes.dtype == np.int32
+    no_sample_pairs = []
+
+    N_Objects, _ = target_coords.shape
+    N_Boxes, _ = anchor_boxes.shape
+
+    x1, y1, x2, y2 = target_coords.T
+    b_w, b_h = anchor_boxes.T
+    
+    # (N_Objects, 2)
+    target_centers = np.stack([target_coords[:,[0,2]].mean(-1), target_coords[:,[1,3]].mean(-1)], axis=0).T
+
+    # (B, )
+    half_b_w = b_w / 2.0
+    half_b_h = b_h / 2.0
+
+    # each (B, T)
+    overlap_x_min = np.maximum(np.ceil(x1[:,None] - half_b_w[None, :] + 1), 0).T.astype(np.int32)
+    overlap_x_max = np.minimum(np.floor(x2[:,None] + half_b_w[None, :] - 1), IMAGE_SIZE - 1).T.astype(np.int32)
+    overlap_y_min = np.maximum(np.ceil(y1[:,None] - half_b_h[None, :] + 1), 0).T.astype(np.int32)
+    overlap_y_max = np.minimum(np.floor(y2[:,None] + half_b_h[None, :] - 1), IMAGE_SIZE - 1).T.astype(np.int32)
+
+    mask = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.int32)
+    sampled_centers = - np.ones((N_Boxes, 2))
+
+    for b_idx in range(N_Boxes):
+        mask[:, :] = 0
+        # should follow the shape of anchor box
+        sigma_x = b_w[b_idx] / SIG_SCALE
+        sigma_y = b_h[b_idx] / SIG_SCALE
+
+        # 1st pass : Make bit mask for this anchor box A, loop for all GT objects
+        for t_idx in range(N_Objects):
+            x_min = overlap_x_min[b_idx, t_idx]
+            x_max = overlap_x_max[b_idx, t_idx]
+            y_min = overlap_y_min[b_idx, t_idx]
+            y_max = overlap_y_max[b_idx, t_idx]
+
+            mask[x_min : (x_max + 1), y_min : (y_max + 1)] |= (1<<t_idx)
+        
+        
+        # 2nd pass : For each GT object, sample with Gaussian dist from valid center points
+        
+        x_min = overlap_x_min[b_idx, target_idx]
+        x_max = overlap_x_max[b_idx, target_idx]
+        y_min = overlap_y_min[b_idx, target_idx]
+        y_max = overlap_y_max[b_idx, target_idx]
+
+        # ROI : we only look at overlap region of anchor box & GT object
+        ROI = mask[x_min : (x_max + 1), y_min : (y_max + 1)]
+        ROI_start = np.array([x_min, y_min])
+
+        # centers that only overlap with this single GT object
+        local_anchor_center_candidates = (ROI == 1<<target_idx)
+        n_centers = local_anchor_center_candidates.sum()
+
+        # we skip if there are none.
+        if n_centers == 0:
+            no_sample_pairs.append((b_idx, target_idx))
+
+        # If there is one, we sample using gaussian!
+        else:
+            # possible center points
+            valid_coords = np.argwhere(local_anchor_center_candidates) + ROI_start
+
+            # distance from GT object center
+            dist_squared = ((valid_coords[:, 0] - target_centers[target_idx, 0]) / sigma_x) ** 2 + ((valid_coords[:, 1] - target_centers[target_idx, 1]) / sigma_y) ** 2
+            weights = np.exp(-dist_squared / 2.0)
+            weights /= weights.sum()
+
+            sampled = valid_coords[np.random.choice(len(valid_coords), p=weights)]
+            sampled_centers[b_idx] = sampled
+
+    return sampled_centers, no_sample_pairs
+
+
 
 
 # for multiple GT bboxes sampling! (includes both single, and multiple combinations of 1 each if possible)
