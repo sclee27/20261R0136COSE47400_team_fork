@@ -48,13 +48,16 @@ def sample_boxes_gt_linked(gt_boxes: np.ndarray, jitter_cfg, image_size: int,
         s = np.exp(rng.uniform(np.log(lo), np.log(hi), M))
     else:
         s = rng.uniform(lo, hi, M)
+    
+    # we added ratio!
+    ratio = rng.uniform(0.8, 1.2, M)
 
     pf = jitter_cfg.pos_frac
     dx = rng.uniform(-pf, pf, M) * w[src]
     dy = rng.uniform(-pf, pf, M) * h[src]
 
     nw = np.maximum(w[src] * s, 1.0)
-    nh = np.maximum(h[src] * s, 1.0)
+    nh = np.maximum(h[src] * s * ratio, 1.0)
     ncx = cx[src] + dx
     ncy = cy[src] + dy
 
@@ -69,15 +72,16 @@ def sample_boxes_gt_linked(gt_boxes: np.ndarray, jitter_cfg, image_size: int,
     keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     return boxes[keep], src[keep]
 
-
+# a bit of a problem : the legacy function used inside is based on IMAGE_SCALE in legacy file, hardcoded. 
+# Not a problem if we keep using 640!!
 def sample_boxes_gt_linked_v2(gt_boxes: np.ndarray, jitter_cfg, image_size: int,
                               rng: np.random.Generator):
     """Version 2: keep GT-linked size sampling but obtain centers from
     legacy center-sampling routines in `anchor_box_generate_center_sample.py`.
 
     For each GT we generate `n_candidates` scales (same as `sample_boxes_gt_linked`),
-    then call `legacy.get_GToverlap_center_regions_SINGLE` with the candidate
-    anchor shapes for that GT to obtain centers constrained to overlap regions.
+    then call `legacy.get_GToverlap_center_regions_SINGLE_for_one_GT` with the candidate
+    anchor shapes for that GT to obtain centers constrained to single overlap regions.
     If the legacy sampler fails to produce a center for a candidate, we fall
     back to the original jittered center.
 
@@ -100,6 +104,9 @@ def sample_boxes_gt_linked_v2(gt_boxes: np.ndarray, jitter_cfg, image_size: int,
         s = np.exp(rng.uniform(np.log(lo), np.log(hi), N * n))
     else:
         s = rng.uniform(lo, hi, N * n)
+    # we added ratio!
+    ratio = rng.uniform(0.8, 1.2, N * n)
+
 
     pf = jitter_cfg.pos_frac
     # per-candidate offsets (used as fallback if legacy sampling returns none)
@@ -107,10 +114,12 @@ def sample_boxes_gt_linked_v2(gt_boxes: np.ndarray, jitter_cfg, image_size: int,
     dy = rng.uniform(-pf, pf, N * n) * h[src]
 
     nw = np.maximum(w[src] * s, 1.0)
-    nh = np.maximum(h[src] * s, 1.0)
+    nh = np.maximum(h[src] * s * ratio, 1.0)
 
     out_boxes = []
     out_src = []
+    
+    targets = gt_boxes.astype(np.int32)
 
     # For each GT, call legacy sampler with its candidate anchor shapes
     for i in range(N):
@@ -123,39 +132,26 @@ def sample_boxes_gt_linked_v2(gt_boxes: np.ndarray, jitter_cfg, image_size: int,
         anchors_int = np.stack([np.round(nw[idxs]).astype(np.int32),
                                  np.round(nh[idxs]).astype(np.int32)], axis=1)
 
-        # legacy expects target coords as (T,4) int32; pass single GT
-        target = gt_boxes[i:i+1].astype(np.int32)
+        sampled_centers, no_sample_pairs = legacy.get_GToverlap_center_regions_SINGLE_for_one_GT(
+            i, targets, anchors_int)
 
-        sampled_centers, no_sample_pairs = legacy.get_GToverlap_center_regions_SINGLE(
-            target, anchors_int)
+        # sampled_centers: (B, 2) — fill missing (-1) rows with jittered fallback
+        missing = sampled_centers[:, 0] < 0               # (B,)
+        fallback_cx = cx[i] + dx[idxs]                    # (B,)
+        fallback_cy = cy[i] + dy[idxs]                    # (B,)
+        ccx = np.where(missing, fallback_cx, sampled_centers[:, 0])
+        ccy = np.where(missing, fallback_cy, sampled_centers[:, 1])
 
-        # sampled_centers: (B, T, 2) where T=1 here
-        for local_k, global_idx in enumerate(idxs):
-            bw, bh = anchors_int[local_k]
-
-            # fallback jittered center
-            ncx = cx[i] + dx[global_idx]
-            ncy = cy[i] + dy[global_idx]
-
-            # legacy returns -1 for missing samples
-            center = sampled_centers[local_k, 0]
-            if center[0] < 0 or center[1] < 0:
-                ccx, ccy = float(ncx), float(ncy)
-            else:
-                ccx, ccy = float(center[0]), float(center[1])
-
-            x1 = ccx - bw / 2.0
-            y1 = ccy - bh / 2.0
-            x2 = ccx + bw / 2.0
-            y2 = ccy + bh / 2.0
-
-            out_boxes.append([x1, y1, x2, y2])
-            out_src.append(i)
+        bw = anchors_int[:, 0].astype(float)               # (B,)
+        bh = anchors_int[:, 1].astype(float)               # (B,)
+        boxes_i = np.stack([ccx - bw/2, ccy - bh/2, ccx + bw/2, ccy + bh/2], axis=1)
+        out_boxes.append(boxes_i)
+        out_src.extend([i] * len(idxs))
 
     if not out_boxes:
         return np.zeros((0, 4), np.int32), np.zeros(0, int)
 
-    boxes = np.clip(np.array(out_boxes), 0, image_size - 1).astype(np.int32)
+    boxes = np.clip(np.vstack(out_boxes), 0, image_size - 1).astype(np.int32)
     src = np.array(out_src, dtype=int)
     keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     return boxes[keep], src[keep]
