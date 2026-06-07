@@ -339,26 +339,34 @@ class YOLOBBoxEvaluator(nn.Module):
         'rejected': (B, A) bool         -- True if ratio > 1:4 (not scored)
     """
 
-    def __init__(self, num_classes: int = NUM_CLASSES):
+    def __init__(self, num_classes: int = NUM_CLASSES,
+                 enabled_levels: list = None):
         super().__init__()
         self.num_classes = num_classes
+        self.enabled_levels = enabled_levels if enabled_levels is not None else list(LEVEL_NAMES)
 
-        # Full-map convs (conv-first design -- applied before ROI crop)
-        self.orig_conv = OriginalImageConv()
+        # Full-map convs -- only instantiate for enabled levels
+        if 'orig' in self.enabled_levels:
+            self.orig_conv = OriginalImageConv()
         self.full_map_convs = nn.ModuleDict({
-            'p1': P1FullMapConv(),
-            'p2': P2FullMapConv(),
-            'p3': P3FullMapConv(),
-            'p4': P4FullMapConv()
+            lvl: cls() for lvl, cls in [
+                ('p1', P1FullMapConv),
+                ('p2', P2FullMapConv),
+                ('p3', P3FullMapConv),
+                ('p4', P4FullMapConv),
+            ] if lvl in self.enabled_levels
         })
 
-        # Evaluator heads (applied to ROI-cropped patches)
+        # Evaluator heads -- only instantiate for enabled levels
+        _head_ctors = {
+            'orig': lambda: OriginalImageNet(num_classes),
+            'p1':   lambda: P1Net(num_classes),
+            'p2':   lambda: P2Net(num_classes),
+            'p3':   lambda: P3Net(num_classes),
+            'p4':   lambda: P4Net(num_classes),
+        }
         self.nets = nn.ModuleDict({
-            'orig': OriginalImageNet(num_classes),
-            'p1':   P1Net(num_classes),
-            'p2':   P2Net(num_classes),
-            'p3':   P3Net(num_classes),
-            'p4':   P4Net(num_classes),
+            lvl: _head_ctors[lvl]() for lvl in self.enabled_levels
         })
 
     # ------------------------------------------------------------------
@@ -382,8 +390,7 @@ class YOLOBBoxEvaluator(nn.Module):
 
         return ((longer / (shorter + 1e-6)) <= max_ratio) & (shorter <= 320)
 
-    @staticmethod
-    def _assign_levels(bboxes: torch.Tensor) -> torch.Tensor:
+    def _assign_levels(self, bboxes: torch.Tensor) -> torch.Tensor:
         """
         Vectorized level assignment based on shorter side S.
 
@@ -391,7 +398,7 @@ class YOLOBBoxEvaluator(nn.Module):
             bboxes: (N, 4) [x1, y1, x2, y2]
         Returns:
             level_ids: (N,) long tensor
-                0=orig, 1=p1, 2=p2, 3=p3, 4=p4
+                0=orig, 1=p1, 2=p2, 3=p3, 4=p4, -1=disabled level
         """
         w = bboxes[:, 2] - bboxes[:, 0]
         h = bboxes[:, 3] - bboxes[:, 1]
@@ -402,28 +409,45 @@ class YOLOBBoxEvaluator(nn.Module):
         ids[shorter >  40] = 2   # p2
         ids[shorter >  80] = 3   # p3
         ids[shorter > 160] = 4   # p4
+
+        # Mask out disabled levels -- -1 will be excluded by valid_mask downstream
+        enabled_ids = {LEVEL_NAMES.index(lvl) for lvl in self.enabled_levels}
+        all_ids = set(range(len(LEVEL_NAMES)))
+        for disabled_id in (all_ids - enabled_ids):
+            ids[ids == disabled_id] = -1
+
         return ids
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-
-    def forward(self, feature_maps: dict, bboxes: torch.Tensor) -> dict:
+    # gt_mask if not None, it should be (B, A)
+    # no gt overlap boxes will have False
+    def forward(self, feature_maps: dict, bboxes: torch.Tensor, gt_mask = None) -> dict:
         B, A, _ = bboxes.shape
-        device   = feature_maps['orig'].device
+        device = next(iter(feature_maps.values())).device
         bboxes   = bboxes.to(device)
-
+        # (B, A)
+        if gt_mask is not None:
+            gt_overlapping_box_mask = gt_mask.flatten()
+        else:
+            gt_overlapping_box_mask = torch.ones((B * A), dtype=bool, device=device)
+            
         # ── Step 1: Full-map convs (batched over B, once per image) ────────
         processed = {}
-        processed['orig'] = self.orig_conv(feature_maps['orig'])
+        if 'orig' in self.enabled_levels:
+            processed['orig'] = self.orig_conv(feature_maps['orig'])
         for level in ('p1', 'p2', 'p3', 'p4'):
-            processed[level] = self.full_map_convs[level](feature_maps[level])
+            if level in self.enabled_levels:
+                processed[level] = self.full_map_convs[level](feature_maps[level])
 
         # ── Step 2: Vectorized filter and level assignment ──────────────────
         flat = bboxes.view(B * A, 4)                              # (B*A, 4)
-
-        valid_mask  = self._filter_aspect_ratio(flat)             # (B*A,) bool
         level_ids   = self._assign_levels(flat)                   # (B*A,) long
+        ratio_size_mask = self._filter_aspect_ratio(flat) & (level_ids != -1)
+        
+        valid_mask  = ratio_size_mask & gt_overlapping_box_mask     # (B*A,) bool
+        valid_but_rejected_mask = (~ratio_size_mask) & gt_overlapping_box_mask
 
         # ROI format: [batch_idx, x1, y1, x2, y2] in image coords
         b_idx    = torch.arange(B, device=device).repeat_interleave(A)  # (B*A,)
@@ -439,7 +463,8 @@ class YOLOBBoxEvaluator(nn.Module):
         if N_valid > 0:
             level_logits = torch.zeros(N_valid, self.num_classes, device=device)
 
-            for level_id, level_name in enumerate(LEVEL_NAMES):
+            for level_name in self.enabled_levels:
+                level_id = LEVEL_NAMES.index(level_name)
                 lvl_mask = (valid_levels == level_id)
                 if not lvl_mask.any():
                     continue
@@ -463,8 +488,8 @@ class YOLOBBoxEvaluator(nn.Module):
         # ── Step 4: Reshape to (B, A, num_classes) ──────────────────────────
         return {
             'scores':   all_logits.view(B, A, self.num_classes),  # (B, A, num_classes)
-            'valid':    valid_mask.view(B, A),                     # (B, A) bool
-            'rejected': (~valid_mask).view(B, A),                  # (B, A) bool
+            'valid':    valid_mask.view(B, A),                    # (B, A) bool
+            'rejected': valid_but_rejected_mask.view(B, A),       # (B, A) bool
         }
 
 

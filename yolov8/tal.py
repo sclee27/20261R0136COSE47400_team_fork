@@ -235,3 +235,124 @@ class TaskAlignedAssigner(nn.Module):
             fg_mask = mask_pos.sum(-2)
         target_gt_idx = mask_pos.argmax(-2)
         return target_gt_idx, fg_mask, mask_pos
+
+
+
+class TaskAlignedAssigner_With_Teacher(TaskAlignedAssigner):
+    """Task-Aligned Assigner with teacher network used by v8DetectionLoss.
+
+    For each batch image and each GT box, score every anchor by
+    ``score = (predicted-cls-score-for-gt-class)^alpha * (IoU(pred, gt))^beta * (teacher-evaluated-cls-score-for-gt-class)^gamma``,
+    keep top-k anchors falling inside the GT (after rescaling tiny GTs), then
+    resolve multi-GT collisions by IoU.
+    """
+
+    def __init__(
+        self,
+        topk: int = 13,
+        num_classes: int = 80,
+        alpha: float = 1.0,
+        beta: float = 6.0,
+        gamma : float = 1.0,
+        stride: list[int] = (8, 16, 32),
+        eps: float = 1e-9,
+        teacher_network = None,
+        temperature = 1.0
+    ):
+        super().__init__(topk=topk, num_classes=num_classes, alpha=alpha,
+                     beta=beta, stride=stride, eps=eps)
+
+        self.gamma = gamma
+        # teacher network is used to evaluate bboxes in gt
+        self.teacher = teacher_network
+        self.teacher_temperature = temperature
+
+    @torch.no_grad()
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, feats):
+        """Compute (target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx).
+
+        Shapes:
+            pd_scores  : (B, A, C)
+            pd_bboxes  : (B, A, 4)  in xyxy, on image scale
+            anc_points : (A, 2)     in image scale
+            gt_labels  : (B, N, 1)
+            gt_bboxes  : (B, N, 4)  in xyxy
+            mask_gt    : (B, N, 1)  valid-GT mask
+
+            feats      : dict of {'orig' : , 'p1' : , '' : ... }
+                         Each value for a key is a feature map tensor
+        """
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+
+        if self.n_max_boxes == 0:
+            return (
+                torch.full_like(pd_scores[..., 0], self.num_classes),
+                torch.zeros_like(pd_bboxes),
+                torch.zeros_like(pd_scores),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),
+            )
+
+        mask_pos, align_metric, overlaps = self._get_pos_mask(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt, feats
+        )
+
+        target_gt_idx, fg_mask, mask_pos = self._select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
+        target_labels, target_bboxes, target_scores = self._get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+
+        align_metric *= mask_pos
+        pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)
+        pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)
+        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
+        target_scores = target_scores * norm_align_metric
+
+        return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
+
+    # --------------------------------------------------------- internal steps
+
+    def _get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt, feats):
+        mask_in_gts = self._select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
+        align_metric, overlaps = self._get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt, feats)
+        mask_topk = self._select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
+        mask_pos = mask_topk * mask_in_gts * mask_gt
+        return mask_pos, align_metric, overlaps
+    
+    def temperature_softmax(self, teacher_scores_logits):
+        teacher_scores_logits_scaled = teacher_scores_logits / self.teacher_temperature
+        # teacher_scores_logits : (B, A, C)
+        return teacher_scores_logits_scaled.softmax(dim = -1)
+    
+    def _get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt, feats):
+        na = pd_bboxes.shape[-2]
+        mask_gt = mask_gt.bool()
+        # For efficiency, we only train for mask_gt's non zero existing rows
+        # teacher inference!!!
+        teacher_dict = self.teacher(feats, pd_bboxes, mask_gt.any(dim = 1))
+        # (B, A, C)
+        teacher_scores = self.temperature_softmax(teacher_dict['scores'])
+        ''' rejected means in_gt, but rejected by ratio or size constraint from teacher network '''
+        rejected_mask = teacher_dict['rejected']
+        ''' we set the teacher-rejected boxes' scores to follow the student's scores '''
+        teacher_scores[rejected_mask] = pd_scores[rejected_mask]
+
+        # initialize matrices
+        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+        student_bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+        teacher_bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+
+        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)
+        ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)
+        ind[1] = gt_labels.squeeze(-1)
+        
+        student_bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]
+        teacher_bbox_scores[mask_gt] = teacher_scores[ind[0], :, ind[1]][mask_gt]
+
+        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
+        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
+        overlaps[mask_gt] = bbox_iou(gt_boxes, pd_boxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
+
+        align_metric = student_bbox_scores.pow(self.alpha) * overlaps.pow(self.beta) * teacher_bbox_scores.pow(self.gamma)
+        return align_metric, overlaps
+    
+'''  One concern that we need to think about : Is mixing softmax with sigmoid probabilities okay?? '''
