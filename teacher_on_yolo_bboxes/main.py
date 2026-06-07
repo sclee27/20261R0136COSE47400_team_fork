@@ -148,37 +148,21 @@ def collect_image_paths(
     ann_dir: Path,
     max_images: int = 0,
 ) -> list[Path]:
-    """Return existing image file paths for `split` from the COCO annotation JSON.
-
-    Images whose files are missing on disk are silently skipped so the script
-    works even with a partial local mirror.  Paths are returned in annotation
-    (image-id) order for reproducibility.
-    """
-    ann_path = ann_dir / _ANN_FILES[split]
-    if not ann_path.exists():
-        raise FileNotFoundError(
-            f"Annotation file not found: {ann_path}\n"
-            "Set ANN_DIR in main.py or check your data_sds/ directory."
-        )
-
-    with open(ann_path) as f:
-        coco = json.load(f)
-
+    """Return existing image file paths for `split` by scanning the images folder,
+    rather than following the annotation JSON."""
     img_dir = images_dir / split
-    paths: list[Path] = []
-    for im in sorted(coco["images"], key=lambda x: x["id"]):
-        p = img_dir / im["file_name"]
-        if p.exists():
-            paths.append(p)
-        if max_images and len(paths) >= max_images:
-            break
+    if not img_dir.is_dir():
+        raise FileNotFoundError(f"Image directory not found: {img_dir}")
+
+    paths = sorted(img_dir.glob("*.jpg")) + sorted(img_dir.glob("*.png"))
+    paths = sorted(paths)  # consistent order
 
     if not paths:
-        raise FileNotFoundError(
-            f"No images found under {img_dir}.\n"
-            f"Expected files like  {img_dir / coco['images'][0]['file_name']}\n"
-            "Pass --images-dir or update _IMAGE_CANDIDATES in main.py."
-        )
+        raise FileNotFoundError(f"No images found under {img_dir}")
+
+    if max_images:
+        paths = paths[:max_images]
+
     return paths
 
 

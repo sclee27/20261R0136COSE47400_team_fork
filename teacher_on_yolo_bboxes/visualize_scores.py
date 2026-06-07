@@ -61,6 +61,19 @@ def _to_np(t: torch.Tensor) -> np.ndarray:
     return t.float().cpu().numpy()
 
 
+def _iou_matrix(bboxes_a: np.ndarray, bboxes_b: np.ndarray) -> np.ndarray:
+    """IoU between every pair in A×B.  Returns (A, B) array."""
+    x1 = np.maximum(bboxes_a[:, None, 0], bboxes_b[None, :, 0])
+    y1 = np.maximum(bboxes_a[:, None, 1], bboxes_b[None, :, 1])
+    x2 = np.minimum(bboxes_a[:, None, 2], bboxes_b[None, :, 2])
+    y2 = np.minimum(bboxes_a[:, None, 3], bboxes_b[None, :, 3])
+    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+    a_a = (bboxes_a[:, 2] - bboxes_a[:, 0]) * (bboxes_a[:, 3] - bboxes_a[:, 1])
+    a_b = (bboxes_b[:, 2] - bboxes_b[:, 0]) * (bboxes_b[:, 3] - bboxes_b[:, 1])
+    union = a_a[:, None] + a_b[None] - inter
+    return inter / np.maximum(union, 1e-9)
+
+
 def _active_mask(result: PipelineResult) -> np.ndarray:
     """Return the primary boolean filter for 'relevant' anchors.
 
@@ -76,16 +89,43 @@ def _max_iou_with_gt(bboxes: np.ndarray, gt_bboxes: np.ndarray) -> np.ndarray:
     """Max IoU of each predicted bbox with any GT bbox.  Returns (A,) float."""
     if gt_bboxes.shape[0] == 0:
         return np.ones(len(bboxes), dtype=float)
-    x1 = np.maximum(bboxes[:, None, 0], gt_bboxes[None, :, 0])   # (A, N)
-    y1 = np.maximum(bboxes[:, None, 1], gt_bboxes[None, :, 1])
-    x2 = np.minimum(bboxes[:, None, 2], gt_bboxes[None, :, 2])
-    y2 = np.minimum(bboxes[:, None, 3], gt_bboxes[None, :, 3])
-    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)       # (A, N)
-    a_pd = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])  # (A,)
-    a_gt = (gt_bboxes[:, 2] - gt_bboxes[:, 0]) * (gt_bboxes[:, 3] - gt_bboxes[:, 1])  # (N,)
-    union = a_pd[:, None] + a_gt[None] - inter                     # (A, N)
-    iou = inter / np.maximum(union, 1e-9)
-    return iou.max(axis=1)                                          # (A,)
+    return _iou_matrix(bboxes, gt_bboxes).max(axis=1)
+
+
+def _per_anchor_gt_class_scores(
+    result: PipelineResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """For each GT-overlapping anchor, return its pd/teacher score at the actual GT class.
+
+    Assigns each anchor to the GT box with highest IoU — more robust than center
+    containment, which silently falls back to class 0 for edge-touching anchors.
+
+    Returns (pd_gt, tch_gt, assigned_classes, anchor_idx) or None when GT
+    info is unavailable or there are no GT boxes.
+    """
+    if (result.gt_mask is None or result.gt_bboxes is None or
+            result.gt_labels is None or result.gt_bboxes.shape[0] == 0):
+        return None
+
+    gt_mask   = _to_np(result.gt_mask).astype(bool)
+    bboxes    = _to_np(result.pd_bboxes)                    # (A, 4)
+    gt_bboxes = _to_np(result.gt_bboxes)                    # (N, 4)
+    gt_labels = _to_np(result.gt_labels).astype(int)        # (N,)
+    pd_all    = _to_np(result.pd_scores)                    # (A, C)
+    tch_all   = _to_np(result.teacher_scores)               # (A, C)
+
+    anchor_idx = np.where(gt_mask)[0]                       # (A_gt,)
+    if len(anchor_idx) == 0:
+        return (np.array([]), np.array([]),
+                np.array([], dtype=int), anchor_idx)
+
+    iou            = _iou_matrix(bboxes[anchor_idx], gt_bboxes)  # (A_gt, N)
+    best_gt        = iou.argmax(axis=1)                     # (A_gt,)
+    assigned_class = gt_labels[best_gt]                     # (A_gt,)
+
+    pd_gt  = pd_all[anchor_idx, assigned_class]
+    tch_gt = tch_all[anchor_idx, assigned_class]
+    return pd_gt, tch_gt, assigned_class, anchor_idx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +134,57 @@ def _max_iou_with_gt(bboxes: np.ndarray, gt_bboxes: np.ndarray) -> np.ndarray:
 
 def plot_scatter(result: PipelineResult, class_idx: int,
                  class_names: list[str], ax: plt.Axes) -> None:
+    # ── GT-class mode: score at actual GT class per anchor ────────────────────
+    gt_scores = _per_anchor_gt_class_scores(result)
+    if gt_scores is not None:
+        pd_gt, tch_gt, assigned_classes, anchor_idx = gt_scores
+
+        if len(pd_gt) == 0:
+            ax.text(0.5, 0.5, "no GT-overlapping anchors",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=9, color="#64748b")
+            ax.set_title("Scatter — score at GT-assigned class", fontsize=9)
+            return
+
+        valid_a    = _to_np(result.teacher_valid).astype(bool)[anchor_idx]
+        rejected_a = _to_np(result.teacher_rejected).astype(bool)[anchor_idx]
+
+        unique_cls = np.unique(assigned_classes)
+        n_cls      = len(unique_cls)
+        cmap       = plt.cm.get_cmap("tab10" if n_cls <= 10 else "tab20")
+
+        for ci, c in enumerate(unique_cls):
+            c_mask = assigned_classes == c
+            cname  = class_names[c] if c < len(class_names) else str(c)
+            col    = cmap(ci % cmap.N)
+
+            # All points for this GT class (circle = valid/unscored)
+            ax.scatter(pd_gt[c_mask], tch_gt[c_mask], s=12, alpha=0.7,
+                       color=col, label=f"GT:{cname} ({c_mask.sum()})", zorder=2)
+            # Overlay rejected anchors with X marker (no extra legend entry)
+            r_mask = c_mask & rejected_a
+            if r_mask.any():
+                ax.scatter(pd_gt[r_mask], tch_gt[r_mask], s=20, alpha=1.0,
+                           color=col, marker="x", linewidths=1.5, zorder=4)
+
+        lim = max(pd_gt.max(), tch_gt.max(), 0.05) + 0.02
+        ax.plot([0, lim], [0, lim], "k--", lw=0.8, alpha=0.4, label="y=x")
+
+        r, p_val = (spearmanr(pd_gt, tch_gt) if len(pd_gt) > 2 else (0.0, 1.0))
+        ax.set_title(
+            f"Scatter — score at GT-assigned class per anchor\n"
+            f"Spearman ρ={r:.3f} (p={p_val:.2e})  n={len(pd_gt)}"
+            f"  (x marker = teacher-rejected)",
+            fontsize=9,
+        )
+        ax.set_xlabel("pd_score at GT class (student)", fontsize=8)
+        ax.set_ylabel("teacher_score at GT class", fontsize=8)
+        ax.legend(fontsize=7, markerscale=1.5)
+        ax.set_xlim(0, None)
+        ax.set_ylim(0, None)
+        return
+
+    # ── Fallback: fixed class_idx (no GT label info available) ───────────────
     pd       = _to_np(result.pd_scores[:, class_idx])
     tch      = _to_np(result.teacher_scores[:, class_idx])
     valid    = _to_np(result.teacher_valid).astype(bool)
@@ -107,7 +198,6 @@ def plot_scatter(result: PipelineResult, class_idx: int,
         in_gt_unscored = gt & ~valid & ~rejected
         not_gt         = ~gt
 
-        # Non-GT anchors shown very faintly as context
         ax.scatter(pd[not_gt], tch[not_gt], s=2, alpha=0.08, c="#334155",
                    label=f"outside GT ({not_gt.sum()})", zorder=1)
         if in_gt_unscored.any():
@@ -154,6 +244,43 @@ def plot_scatter(result: PipelineResult, class_idx: int,
 
 def plot_distributions(result: PipelineResult, class_idx: int,
                         class_names: list[str], ax: plt.Axes) -> None:
+    # ── GT-class mode ─────────────────────────────────────────────────────────
+    gt_scores = _per_anchor_gt_class_scores(result)
+    if gt_scores is not None:
+        pd_gt, tch_gt, assigned_classes, anchor_idx = gt_scores
+
+        valid_a  = _to_np(result.teacher_valid).astype(bool)[anchor_idx]
+        tch_plot = tch_gt[valid_a]
+
+        max_val = max(
+            pd_gt.max()   if len(pd_gt)   else 0.0,
+            tch_plot.max() if len(tch_plot) else 0.0,
+        )
+        bins = np.linspace(0, max_val + 0.01, 50)
+
+        ax.hist(pd_gt,   bins=bins, alpha=0.55, color="#3b82f6",
+                label=f"pd @ GT class ({len(pd_gt)})", density=True)
+        ax.hist(tch_plot, bins=bins, alpha=0.55, color="#22c55e",
+                label=f"teacher @ GT class, valid ({len(tch_plot)})", density=True)
+
+        if len(pd_gt):
+            ax.axvline(pd_gt.mean(), color="#1d4ed8", lw=1.2, ls="--",
+                       label=f"pd mean={pd_gt.mean():.3f}")
+        if len(tch_plot):
+            ax.axvline(tch_plot.mean(), color="#15803d", lw=1.2, ls="--",
+                       label=f"teacher mean={tch_plot.mean():.3f}")
+        else:
+            ax.text(0.5, 0.5, "no valid GT anchors", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=9, color="#64748b")
+
+        ax.set_title("Score distributions @ GT-assigned class\n"
+                     "(GT-overlapping anchors only)", fontsize=9)
+        ax.set_xlabel("Score at GT class", fontsize=8)
+        ax.set_ylabel("Density", fontsize=8)
+        ax.legend(fontsize=7)
+        return
+
+    # ── Fallback: fixed class_idx ─────────────────────────────────────────────
     pd    = _to_np(result.pd_scores[:, class_idx])
     tch   = _to_np(result.teacher_scores[:, class_idx])
     valid = _to_np(result.teacher_valid).astype(bool)
