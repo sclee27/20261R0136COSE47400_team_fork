@@ -111,7 +111,13 @@ class YOLOv8Backbone(nn.Module):
         theirs_sd = {k: v.float() for k, v in official_obj.state_dict().items()}
 
         ours_sd = full_model.state_dict()
-        mapped = {k: v for k, v in theirs_sd.items() if k in ours_sd}
+        # Keep only keys that exist AND match shape, so a non-COCO checkpoint
+        # (e.g. SDS-fine-tuned nc=5) loads its backbone cleanly while the
+        # shape-mismatched Detect head (nc) is dropped -- we slice the head off
+        # anyway. (strict=False does NOT tolerate size mismatches, only missing
+        # keys, so the shape guard is required here.)
+        mapped = {k: v for k, v in theirs_sd.items()
+                  if k in ours_sd and v.shape == ours_sd[k].shape}
         missing = sorted(set(ours_sd) - set(mapped))
 
         # Only the Detect cls-head output conv may be missing (nc=80 mismatch

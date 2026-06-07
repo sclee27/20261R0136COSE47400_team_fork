@@ -15,6 +15,7 @@ artifact and is NOT saved (only evaluator weights are).
 """
 from __future__ import annotations
 
+import csv
 import os
 import sys
 
@@ -131,8 +132,12 @@ def print_level_table(meter: LevelMeter, enabled: list, indent: str = "    "):
 # ---------------------------------------------------------------------------
 def run_epoch(model, loader, device, criterion, num_fg, upper_short, enabled_levels,
               optimizer=None, scaler=None, amp=False, log_every=50, epoch=0,
-              train=True):
-    """Run a single epoch; returns a LevelMeter with the accumulated metrics."""
+              train=True, step_writer=None):
+    """Run a single epoch; returns a LevelMeter with the accumulated metrics.
+
+    If `step_writer` (a csv.writer) is given and we are training, one row per
+    optimizer step is logged: [epoch, step, loss, running_acc].
+    """
     model.evaluator.train(mode=train)
     model.backbone.eval()    # backbone stays frozen / eval always
     meter = LevelMeter(num_fg, upper_short)
@@ -142,6 +147,7 @@ def run_epoch(model, loader, device, criterion, num_fg, upper_short, enabled_lev
     for batch in loader:
         if batch is None:               # collate dropped an all-empty batch
             continue
+        step += 1
         images = batch["images"].to(device, non_blocking=True)
         boxes = batch["boxes"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
@@ -178,7 +184,8 @@ def run_epoch(model, loader, device, criterion, num_fg, upper_short, enabled_lev
 
         # -- metrics (no grad) -------------------------------------------
         if loss is not None:
-            meter.add_loss(float(loss.detach()))
+            step_loss = float(loss.detach())
+            meter.add_loss(step_loss)
             with torch.no_grad():
                 u = usable
                 preds = flat_scores[u].argmax(dim=-1)
@@ -186,13 +193,41 @@ def run_epoch(model, loader, device, criterion, num_fg, upper_short, enabled_lev
                 labels_u = flat_labels[u].detach().cpu().numpy()
                 preds_u = preds.detach().cpu().numpy()
             meter.update(boxes_u, labels_u, preds_u)
+            if train and step_writer is not None:
+                step_writer.writerow([epoch, step, round(step_loss, 6), round(meter.acc, 6)])
 
-        step += 1
         if train and log_every and step % log_every == 0:
             print(f"    [epoch {epoch}] step {step}  loss {meter.avg_loss:.4f}  "
                   f"acc {meter.acc:.3f}")
 
     return meter
+
+
+# ---------------------------------------------------------------------------
+# CSV metric logging (per-epoch table -> graphs later)
+# ---------------------------------------------------------------------------
+def epoch_csv_fieldnames() -> list:
+    """Columns for metrics.csv: aggregates + per-level val metrics."""
+    cols = ["epoch", "train_loss", "train_acc", "val_loss", "val_acc"]
+    for name in LEVEL_ORDER:
+        cols += [f"val_{name}_acc", f"val_{name}_posrec", f"val_{name}_n"]
+    return cols
+
+
+def epoch_csv_row(epoch: int, tr: "LevelMeter", va: "LevelMeter") -> dict:
+    """One metrics.csv row from the train/val meters of an epoch."""
+    row = {
+        "epoch": epoch,
+        "train_loss": round(tr.avg_loss, 6), "train_acc": round(tr.acc, 6),
+        "val_loss": round(va.avg_loss, 6), "val_acc": round(va.acc, 6),
+    }
+    for name in LEVEL_ORDER:
+        n = va.n[name]
+        row[f"val_{name}_acc"] = round(va.correct[name] / n, 6) if n else 0.0
+        row[f"val_{name}_posrec"] = (round(va.pos_correct[name] / va.pos_n[name], 6)
+                                     if va.pos_n[name] else 0.0)
+        row[f"val_{name}_n"] = n
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -230,35 +265,68 @@ def train(model, train_loader, val_loader, cfg, cfg_dict):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
 
     out_dir = os.path.join(cfg.train.out_dir, cfg.train.exp_name)
+    os.makedirs(out_dir, exist_ok=True)
     num_fg = model.num_fg_classes
     enabled = model.enabled_levels
     upper = model.upper_short
 
+    # -- CSV logs (for plotting later); live under the run dir so renaming the
+    #    run (train.exp_name) renames/relocates them too. -------------------
+    metrics_path = os.path.join(out_dir, "metrics.csv")   # one row per epoch
+    steps_path = os.path.join(out_dir, "steps.csv")       # one row per train step
+    mfile = open(metrics_path, "w", newline="")
+    sfile = open(steps_path, "w", newline="")
+    mwriter = csv.DictWriter(mfile, fieldnames=epoch_csv_fieldnames())
+    mwriter.writeheader()
+    swriter = csv.writer(sfile)
+    swriter.writerow(["epoch", "step", "loss", "running_acc"])
+    print(f"[csv] per-epoch -> {metrics_path}\n[csv] per-step  -> {steps_path}")
+
     best_acc = -1.0
     best_metrics = None
+    no_improve = 0          # epochs since the last val-acc improvement
+    try:
+        for epoch in range(1, cfg.train.epochs + 1):
+            tr = run_epoch(model, train_loader, device, criterion, num_fg, upper, enabled,
+                           optimizer=optimizer, scaler=scaler, amp=cfg.train.amp,
+                           log_every=cfg.train.log_every, epoch=epoch, train=True,
+                           step_writer=swriter)
 
-    for epoch in range(1, cfg.train.epochs + 1):
-        tr = run_epoch(model, train_loader, device, criterion, num_fg, upper, enabled,
-                       optimizer=optimizer, scaler=scaler, amp=cfg.train.amp,
-                       log_every=cfg.train.log_every, epoch=epoch, train=True)
+            va = run_epoch(model, val_loader, device, criterion, num_fg, upper, enabled,
+                           optimizer=None, scaler=None, amp=False, epoch=epoch, train=False)
 
-        va = run_epoch(model, val_loader, device, criterion, num_fg, upper, enabled,
-                       optimizer=None, scaler=None, amp=False, epoch=epoch, train=False)
+            is_best = va.acc > best_acc
+            tag = "  *best*" if is_best else ""
+            print(f"\nepoch {epoch:02d}/{cfg.train.epochs}  "
+                  f"train_loss {tr.avg_loss:.4f} acc {tr.acc:.3f} | "
+                  f"val_loss {va.avg_loss:.4f} acc {va.acc:.3f}{tag}")
+            print_level_table(va, enabled)
 
-        is_best = va.acc > best_acc
-        tag = "  *best*" if is_best else ""
-        print(f"\nepoch {epoch:02d}/{cfg.train.epochs}  "
-              f"train_loss {tr.avg_loss:.4f} acc {tr.acc:.3f} | "
-              f"val_loss {va.avg_loss:.4f} acc {va.acc:.3f}{tag}")
-        print_level_table(va, enabled)
+            # append + flush so the CSV is usable even mid-run / on crash
+            mwriter.writerow(epoch_csv_row(epoch, tr, va))
+            mfile.flush()
+            sfile.flush()
 
-        metrics = {"train_loss": tr.avg_loss, "train_acc": tr.acc,
-                   "val_loss": va.avg_loss, "val_acc": va.acc}
-        save_checkpoint(os.path.join(out_dir, "last.pt"), model, cfg_dict, epoch, metrics)
-        if is_best:
-            best_acc = va.acc
-            best_metrics = metrics
-            save_checkpoint(os.path.join(out_dir, "best.pt"), model, cfg_dict, epoch, metrics)
+            metrics = {"train_loss": tr.avg_loss, "train_acc": tr.acc,
+                       "val_loss": va.avg_loss, "val_acc": va.acc}
+            save_checkpoint(os.path.join(out_dir, "last.pt"), model, cfg_dict, epoch, metrics)
+            if is_best:
+                best_acc = va.acc
+                best_metrics = metrics
+                no_improve = 0
+                save_checkpoint(os.path.join(out_dir, "best.pt"), model, cfg_dict, epoch, metrics)
+            else:
+                no_improve += 1
+
+            # Early stopping: stop once val-acc has not improved for `patience`
+            # epochs (patience == 0 disables it). best.pt already holds the peak.
+            if cfg.train.patience and no_improve >= cfg.train.patience:
+                print(f"\n[early stop] val-acc no improvement for {cfg.train.patience} epochs "
+                      f"-> stopping at epoch {epoch} (best {best_acc:.3f} @ epoch {epoch - no_improve}).")
+                break
+    finally:
+        mfile.close()
+        sfile.close()
 
     print(f"\n[done] best val acc {best_acc:.3f} -> {os.path.join(out_dir, 'best.pt')}")
     return best_metrics

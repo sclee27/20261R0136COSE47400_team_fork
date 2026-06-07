@@ -81,7 +81,8 @@ class ValCfg:
 
 @dataclass
 class TrainCfg:
-    epochs: int             # number of training epochs
+    epochs: int             # MAX number of training epochs
+    patience: int           # early stop after N epochs w/o val-acc improvement (0 = off)
     batch_size: int         # images per step (1 = per-image, variable #boxes)
     lr: float               # base learning rate
     weight_decay: float     # L2 / decoupled weight decay
@@ -182,7 +183,8 @@ def load_train_config(path, overrides: list[str] | None = None) -> TeacherTrainC
                          num_classes=int(ds["num_classes"]))
 
     t = d["train"]
-    train = TrainCfg(epochs=int(t["epochs"]), batch_size=int(t["batch_size"]),
+    train = TrainCfg(epochs=int(t["epochs"]), patience=int(t.get("patience", 0)),
+                     batch_size=int(t["batch_size"]),
                      lr=float(t["lr"]), weight_decay=float(t["weight_decay"]),
                      optimizer=str(t["optimizer"]), momentum=float(t["momentum"]),
                      device=str(t["device"]), amp=bool(t["amp"]),

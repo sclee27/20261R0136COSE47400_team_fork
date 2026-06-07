@@ -26,8 +26,8 @@ jitter:                    # used by jittering / jittering_v2 modes
   scale: [0.7, 2.0]        # TUNABLE: box_short = GT_short * U(lo, hi)
   log: false               # true -> log-uniform scale draw
   pos_frac: 0.6            # TUNABLE: center offset = U(+/-pos_frac) * GT_size
-  n_candidates: 16         # TUNABLE: candidate boxes generated per GT
-
+  n_candidates: 20         # TUNABLE: candidate boxes generated per GT
+                           # n_candidates 알고리즘 computation 생각해보기
 stride:                    # used by original (stride) mode
   strides: [1, 2, 4, 8, 16, 32]
   n_short: 3               # short-side sizes per stride
@@ -35,11 +35,11 @@ stride:                    # used by original (stride) mode
   sig_scale: 4.0           # gaussian center-sampling spread
 
 label:
-  iou_pos: 0.5             # TUNABLE: IoU >= this -> positive box
-  iou_neg: 0.2             # TUNABLE: IoU <  this -> background; between = ignore
+  iou_pos: 0.2             # TUNABLE: IoU >= this -> positive box
+  iou_neg: 0.0             # TUNABLE: IoU <  this -> background; between = ignore
   stratify_bins: 5         # IoU bins used to balance positives
-  n_per_bin: 4             # max positives sampled per IoU bin
-
+  n_per_bin: 1             # max positives sampled per IoU bin
+  #N_per_bin을 각 object에 대해?
 data:
   ann_dir: data_sds/annotations
   split: train
@@ -70,14 +70,16 @@ backbone:
 
 # -- optimization ------------------------------------------------------
 train:
-  epochs: 30
+  epochs: 50               # MAX epochs (early stopping may end sooner)
+  patience: 8              # stop if val-acc doesn't improve for this many epochs (0 = off)
   batch_size: 1            # per-image (variable #boxes per image)
   lr: 0.001
   weight_decay: 0.0005
   optimizer: adamw         # adamw | sgd
   momentum: 0.9            # SGD momentum (ignored by adamw)
   device: auto             # auto | cpu | cuda | cuda:0
-  amp: true                # mixed precision (cuda only)
+  amp: false               # mixed precision off: the ROI evaluator's logit buffer
+                           # is float32 and isn't autocast-safe (half/float mismatch)
   num_workers: 4
   out_dir: teacher/runs    # outputs -> <out_dir>/<exp_name>
   exp_name: teacher_jittering_orig-p1-p2
